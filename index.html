@@ -138,14 +138,13 @@ async function createTeam() {
     const teamRef = await addDoc(collection(db, 'teams'), {
       name, inviteCode, createdBy: currentUser.uid, createdAt: serverTimestamp()
     });
-    const memberId = genId();
-    await setDoc(doc(db, 'team_members', memberId), {
+    await setDoc(doc(db, 'team_members', currentUser.uid), {
       uid: currentUser.uid, teamId: teamRef.id,
       name: currentUser.displayName, email: currentUser.email,
       photo: currentUser.photoURL, role: 'admin', joinedAt: serverTimestamp()
     });
     currentTeam = { id: teamRef.id, name, inviteCode };
-    currentMember = { id: memberId, uid: currentUser.uid, teamId: teamRef.id,
+    currentMember = { id: currentUser.uid, uid: currentUser.uid, teamId: teamRef.id,
       name: currentUser.displayName, role: 'admin' };
     await initApp();
   } catch(e) {
@@ -168,14 +167,13 @@ async function joinTeam() {
     const existQ = query(collection(db,'team_members'), where('uid','==',currentUser.uid), where('teamId','==',teamId));
     const existSnap = await getDocs(existQ);
     if (!existSnap.empty) { toast('Already in this team!', 'warn'); setBtnLoading('joinTeamBtn', false); return; }
-    const memberId = genId();
-    await setDoc(doc(db, 'team_members', memberId), {
+    await setDoc(doc(db, 'team_members', currentUser.uid), {
       uid: currentUser.uid, teamId,
       name: currentUser.displayName, email: currentUser.email,
       photo: currentUser.photoURL, role: 'member', joinedAt: serverTimestamp()
     });
     currentTeam = { id: teamId, ...teamDoc.data() };
-    currentMember = { id: memberId, uid: currentUser.uid, teamId,
+    currentMember = { id: currentUser.uid, uid: currentUser.uid, teamId,
       name: currentUser.displayName, role: 'member' };
     await initApp();
   } catch(e) {
@@ -192,6 +190,8 @@ async function initApp() {
   document.getElementById('userAvatar').src = currentUser.photoURL || '';
   document.getElementById('userAvatarFallback').textContent = (currentUser.displayName||'?')[0].toUpperCase();
 
+  // Migrate own member doc to use uid as document ID (one-time fix)
+  await migrateMemberDoc();
   // Load team members
   await loadTeamMembers();
   // Set up real-time listeners
@@ -203,6 +203,37 @@ async function initApp() {
   switchPage('today');
 }
 
+// One-time migration: ensure current user's member doc uses uid as document ID
+// Fixes old docs created with genId() so isAdminOf() works in Firestore rules
+async function migrateMemberDoc() {
+  try {
+    // Check if uid-keyed doc already exists
+    const uidDoc = await getDoc(doc(db, 'team_members', currentUser.uid));
+    if (uidDoc.exists()) return; // already migrated
+
+    // Find old doc by querying on uid field
+    const q = query(collection(db,'team_members'),
+      where('uid','==', currentUser.uid),
+      where('teamId','==', currentTeam.id));
+    const snap = await getDocs(q);
+    if (snap.empty) return;
+
+    const oldDoc = snap.docs[0];
+    const data = oldDoc.data();
+
+    // Write new doc with uid as document ID
+    await setDoc(doc(db, 'team_members', currentUser.uid), data);
+    // Delete old random-ID doc
+    await deleteDoc(doc(db, 'team_members', oldDoc.id));
+
+    // Update currentMember
+    currentMember = { id: currentUser.uid, ...data };
+    console.log('Member doc migrated to uid-keyed doc');
+  } catch(e) {
+    console.warn('migrateMemberDoc failed (non-critical):', e);
+  }
+}
+
 function isAdmin() { return currentMember && currentMember.role === 'admin'; }
 
 async function loadTeamMembers() {
@@ -210,7 +241,13 @@ async function loadTeamMembers() {
     query(collection(db,'team_members'), where('teamId','==',currentTeam.id))
   );
   teamMembers = {};
-  snap.forEach(d => { teamMembers[d.data().uid] = { id: d.id, ...d.data() }; });
+  snap.forEach(d => {
+    teamMembers[d.data().uid] = { id: d.id, ...d.data() };
+  });
+  // Refresh currentMember with latest data from Firestore (catches role updates)
+  if (teamMembers[currentUser.uid]) {
+    currentMember = teamMembers[currentUser.uid];
+  }
 }
 
 function setupListeners() {
@@ -230,31 +267,30 @@ function setupListeners() {
   });
   unsubs.push(u1);
 
-  // All tasks (admin only — real-time listener)
-  if (isAdmin()) {
-    const allTasksQ = query(
-      collection(db, 'tasks'),
-      where('teamId', '==', currentTeam.id)
-    );
-    const u2 = onSnapshot(allTasksQ, snap => {
-      allTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      // Auto-refresh admin pages if currently viewing them
-      if (currentPage === 'team') renderTeamPage();
-      if (currentPage === 'leaderboard') renderLeaderboard();
-    });
-    unsubs.push(u2);
-  }
+  // All team tasks listener — needed for leaderboard and admin team view
+  // Rules now allow any authenticated member to read all team tasks
+  const allTasksQ = query(
+    collection(db, 'tasks'),
+    where('teamId', '==', currentTeam.id)
+  );
+  const u2 = onSnapshot(allTasksQ, snap => {
+    allTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (currentPage === 'team') renderTeamPage();
+    if (currentPage === 'leaderboard') renderLeaderboard();
+  }, err => {
+    console.error('allTasks listener error:', err.message);
+  });
+  unsubs.push(u2);
 }
 
-// Fresh fetch of all team tasks (used when switching to admin pages)
+// Fresh fetch of all team tasks — used when switching pages
 async function fetchAllTasks() {
-  if (!isAdmin()) return;
   try {
     const snap = await getDocs(
       query(collection(db, 'tasks'), where('teamId', '==', currentTeam.id))
     );
     allTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  } catch(e) { console.warn('fetchAllTasks:', e); }
+  } catch(e) { console.warn('fetchAllTasks error:', e.message); }
 }
 
 function refreshCurrentPage() {
@@ -278,8 +314,8 @@ function switchPage(pg) {
   document.getElementById('appScroll').scrollTop = 0;
   if (pg==='today')       { renderDayPicker(); renderToday(); }
   if (pg==='inbox')       renderInbox();
-  if (pg==='leaderboard') { fetchAllTasks().then(renderLeaderboard); }
-  if (pg==='team')        { fetchAllTasks().then(renderTeamPage); }
+  if (pg==='leaderboard') renderLeaderboard();
+  if (pg==='team')        renderTeamPage();
   if (pg==='settings')    renderSettings();
 }
 
@@ -578,127 +614,164 @@ function populateAssignDropdown(selectId, selectedUid) {
   ).join('');
 }
 
-// ── LEADERBOARD ───────────────────────────────────────────
-function renderLeaderboard() {
+// ── LEADERBOARD ──────────────────────────────────────────
+// Admin: computes scores directly from allTasks (accurate, real-time)
+// Member: reads from /leaderboards collection (only sees own + others' published scores)
+async function renderLeaderboard() {
   document.querySelectorAll('.ltab').forEach(t=>t.classList.toggle('active',t.dataset.tab===activeLeaderTab));
-  const today = todayStr();
-  let filtered = isAdmin() ? allTasks : myTasks;
-
-  let periodTasks;
-  if (activeLeaderTab==='weekly') {
-    const ws = weekStart(today);
-    const dates = Array.from({length:7},(_,i)=>addDays(ws,i));
-    periodTasks = filtered.filter(t=>dates.includes(t.date));
-  } else if (activeLeaderTab==='monthly') {
-    const mk = monthKey(today);
-    periodTasks = filtered.filter(t=>monthKey(t.date||'')===mk);
-  } else {
-    periodTasks = filtered;
-  }
-
-  // Build scores per member
-  const scores = {};
-  Object.values(teamMembers).forEach(m => {
-    scores[m.uid] = { member: m, total:0, done:0, wip:0, pending:0, ns:0 };
-  });
-  periodTasks.forEach(t => {
-    if (!scores[t.assignedTo]) return;
-    scores[t.assignedTo].total++;
-    scores[t.assignedTo][t.status==='not-started'?'ns':t.status]++;
-  });
-
-  const ranked = Object.values(scores)
-    .filter(s=>s.total>0)
-    .sort((a,b)=>pct(b.done,b.total)-pct(a.done,a.total)||(b.done-a.done));
-
-  const medals = ['🥇','🥈','🥉'];
   const el = document.getElementById('leaderboardList');
+  el.innerHTML = '<div class="empty-state"><div class="spinner" style="margin:0 auto"></div><div class="empty-sub" style="margin-top:12px">Loading…</div></div>';
 
-  if (!ranked.length) {
-    el.innerHTML=`<div class="empty-state"><div class="empty-icon">🏆</div><div class="empty-title">No data yet</div><div class="empty-sub">Tasks will appear here once assigned</div></div>`;
-    return;
-  }
+  const today = todayStr();
+  const medals = ['🥇','🥈','🥉'];
+  let scores = [];
 
-  el.innerHTML = ranked.map((s,i) => {
-    const ratio = pct(s.done,s.total);
-    const isMe = s.member.uid===currentUser.uid;
-    return `
-    <div class="lb-row${isMe?' lb-me':''}">
-      <div class="lb-rank">${i<3?medals[i]:`<span class="lb-num">${i+1}</span>`}</div>
-      <div class="lb-avatar">${(s.member.name||'?')[0].toUpperCase()}</div>
-      <div class="lb-info">
-        <div class="lb-name">${esc(s.member.name)}${isMe?' <span class="you-badge">you</span>':''}</div>
-        <div class="lb-bar-wrap">
-          <div class="lb-bar"><div class="lb-fill" style="width:${ratio}%"></div></div>
-          <span class="lb-pct">${ratio}%</span>
-        </div>
-      </div>
-      <div class="lb-stats">
-        <span class="lb-stat done">${s.done}✓</span>
-        <span class="lb-stat wip">${s.wip}⟳</span>
-        <span class="lb-stat ns">${s.pending+s.ns}⏳</span>
-      </div>
-    </div>`;
-  }).join('');
+  try {
+    if (isAdmin()) {
+      // Fetch all team tasks fresh — compute scores directly, no dependency on members writing scores
+      const snap = await getDocs(
+        query(collection(db,'tasks'), where('teamId','==', currentTeam.id))
+      );
+      allTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
 
-  // Zero-task members at bottom
-  const zeros = Object.values(scores).filter(s=>s.total===0);
-  if (zeros.length) {
-    el.innerHTML += `<div class="lb-divider">No tasks this period</div>` +
-      zeros.map(s=>`
-      <div class="lb-row lb-zero">
-        <div class="lb-rank"><span class="lb-num">—</span></div>
+      // Filter to period
+      let periodTasks = allTasks;
+      if (activeLeaderTab==='weekly') {
+        const ws = weekStart(today);
+        const wdates = Array.from({length:7},(_,i)=>addDays(ws,i));
+        periodTasks = allTasks.filter(t=>wdates.includes(t.date||''));
+      } else if (activeLeaderTab==='monthly') {
+        periodTasks = allTasks.filter(t=>monthKey(t.date||'')===monthKey(today));
+      }
+
+      // Build scores per member from tasks
+      scores = Object.values(teamMembers).map(m => {
+        const mt = periodTasks.filter(t=>t.assignedTo===m.uid);
+        const sc = statusCounts(mt);
+        return { member:m, total:mt.length, done:sc.done||0, open:(sc.wip||0)+(sc.pending||0)+(sc['not-started']||0) };
+      });
+
+    } else {
+      // Non-admin: read from /leaderboards (each member writes own score)
+      let period;
+      if (activeLeaderTab==='weekly')       period = weekKey(today);
+      else if (activeLeaderTab==='monthly') period = monthKey(today);
+      else                                  period = 'alltime';
+
+      const snap = await getDocs(
+        query(collection(db,'leaderboards'),
+          where('teamId','==', currentTeam.id),
+          where('period','==', period))
+      );
+      const lbMap = {};
+      snap.forEach(d => { lbMap[d.data().uid] = d.data(); });
+
+      scores = Object.values(teamMembers).map(m => ({
+        member: m,
+        total:  lbMap[m.uid]?.total || 0,
+        done:   lbMap[m.uid]?.done  || 0,
+        open:   (lbMap[m.uid]?.total||0) - (lbMap[m.uid]?.done||0),
+      }));
+    }
+
+    const ranked = [...scores].filter(s=>s.total>0)
+      .sort((a,b)=>pct(b.done,b.total)-pct(a.done,a.total)||(b.done-a.done));
+    const zeros = scores.filter(s=>s.total===0);
+
+    if (!ranked.length && !zeros.length) {
+      el.innerHTML='<div class="empty-state"><div class="empty-icon">🏆</div><div class="empty-title">No tasks yet</div><div class="empty-sub">Tasks will appear here once added</div></div>';
+      return;
+    }
+
+    el.innerHTML = ranked.map((s,i) => {
+      const ratio = pct(s.done,s.total);
+      const isMe  = s.member.uid===currentUser.uid;
+      return `
+      <div class="lb-row${isMe?' lb-me':''}">
+        <div class="lb-rank">${i<3?medals[i]:`<span class="lb-num">${i+1}</span>`}</div>
         <div class="lb-avatar">${(s.member.name||'?')[0].toUpperCase()}</div>
-        <div class="lb-info"><div class="lb-name">${esc(s.member.name)}</div></div>
-      </div>`).join('');
+        <div class="lb-info">
+          <div class="lb-name">${esc(s.member.name)}${isMe?' <span class="you-badge">you</span>':''}</div>
+          <div class="lb-bar-wrap">
+            <div class="lb-bar"><div class="lb-fill" style="width:${ratio}%"></div></div>
+            <span class="lb-pct">${ratio}%</span>
+          </div>
+        </div>
+        <div class="lb-stats">
+          <span class="lb-stat done">${s.done}✓</span>
+          <span class="lb-stat ns">${s.open}⏳</span>
+        </div>
+      </div>`;
+    }).join('');
+
+    if (zeros.length) {
+      el.innerHTML += `<div class="lb-divider">No tasks this period</div>` +
+        zeros.map(s=>`
+        <div class="lb-row lb-zero">
+          <div class="lb-rank"><span class="lb-num">—</span></div>
+          <div class="lb-avatar">${(s.member.name||'?')[0].toUpperCase()}</div>
+          <div class="lb-info"><div class="lb-name">${esc(s.member.name)}</div></div>
+        </div>`).join('');
+    }
+
+  } catch(e) {
+    el.innerHTML=`<div class="empty-state"><div class="empty-icon">⚠️</div><div class="empty-title">Failed to load</div><div class="empty-sub">${e.message}</div></div>`;
+    console.error('renderLeaderboard:', e);
   }
 }
 
+// Update this user's score in /leaderboards — called after any task change
 async function updateLeaderboardScore() {
-  if (!currentTeam) return;
+  if (!currentTeam || !currentMember) return;
   const today = todayStr();
   const mk = monthKey(today);
   const wk = weekKey(today);
-  const allTime = 'alltime';
 
-  // Calculate my scores
   const calcScore = (tasks) => {
-    const c = statusCounts(tasks);
-    return { done: c.done||0, total: tasks.length, ratio: pct(c.done||0, tasks.length) };
+    const sc = statusCounts(tasks);
+    return { done: sc.done||0, total: tasks.length, ratio: pct(sc.done||0, tasks.length) };
   };
 
-  const monthTasks = myTasks.filter(t=>monthKey(t.date||'')===mk);
   const ws = weekStart(today);
   const weekDates = Array.from({length:7},(_,i)=>addDays(ws,i));
-  const weekTasks = myTasks.filter(t=>weekDates.includes(t.date||''));
+  const weekTasks  = myTasks.filter(t=>weekDates.includes(t.date||''));
+  const monthTasks = myTasks.filter(t=>monthKey(t.date||'')===mk);
+
+  const base = {
+    teamId: currentTeam.id, uid: currentUser.uid,
+    memberName: currentMember.name, updatedAt: serverTimestamp()
+  };
 
   const batch = writeBatch(db);
-  const lbRef = (period) => doc(db,'leaderboards',`${currentTeam.id}_${period}_${currentUser.uid}`);
-
-  batch.set(lbRef(mk), { teamId:currentTeam.id, period:mk, type:'monthly', uid:currentUser.uid,
-    memberName: currentMember.name, ...calcScore(monthTasks), updatedAt: serverTimestamp() });
-  batch.set(lbRef(wk), { teamId:currentTeam.id, period:wk, type:'weekly', uid:currentUser.uid,
-    memberName: currentMember.name, ...calcScore(weekTasks), updatedAt: serverTimestamp() });
-  batch.set(lbRef(allTime), { teamId:currentTeam.id, period:allTime, type:'alltime', uid:currentUser.uid,
-    memberName: currentMember.name, ...calcScore(myTasks), updatedAt: serverTimestamp() });
-
-  try { await batch.commit(); } catch(e) { console.warn('LB update failed', e); }
+  const lbDoc = (p) => doc(db,'leaderboards',`${currentTeam.id}_${p}_${currentUser.uid}`);
+  batch.set(lbDoc(wk),       { ...base, period:wk,       type:'weekly',  ...calcScore(weekTasks) });
+  batch.set(lbDoc(mk),       { ...base, period:mk,       type:'monthly', ...calcScore(monthTasks) });
+  batch.set(lbDoc('alltime'),{ ...base, period:'alltime', type:'alltime', ...calcScore(myTasks) });
+  try { await batch.commit(); } catch(e) { console.warn('LB update failed:', e); }
 }
 
 // ── TEAM PAGE (ADMIN) ─────────────────────────────────────
-function renderTeamPage() {
+async function renderTeamPage() {
   if (!isAdmin()) { document.getElementById('page-team').innerHTML='<div class="empty-state"><div class="empty-icon">🔒</div><div class="empty-title">Admins only</div></div>'; return; }
 
   const memberList = Object.values(teamMembers);
   const el = document.getElementById('teamMemberList');
-
-  // Show loading if allTasks not yet populated
-  if (allTasks.length === 0 && memberList.length > 0) {
-    el.innerHTML = '<div class="empty-state"><div class="spinner" style="margin:0 auto"></div><div class="empty-sub" style="margin-top:12px">Loading task data…</div></div>';
-  }
-
   document.getElementById('teamMemberCount').textContent = memberList.length;
   document.getElementById('teamInviteCode').textContent = currentTeam.inviteCode;
+
+  // Show spinner while fetching
+  el.innerHTML = '<div class="empty-state"><div class="spinner" style="margin:0 auto"></div><div class="empty-sub" style="margin-top:12px">Loading tasks…</div></div>';
+
+  // Always fetch fresh from Firestore — never trust cached allTasks
+  try {
+    const snap = await getDocs(
+      query(collection(db,'tasks'), where('teamId','==', currentTeam.id))
+    );
+    allTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch(e) {
+    el.innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div><div class="empty-title">Failed to load tasks</div><div class="empty-sub">${e.message}</div></div>`;
+    return;
+  }
 
   el.innerHTML = memberList.map(m => {
     const mTasks = allTasks.filter(t=>t.assignedTo===m.uid);
@@ -750,16 +823,11 @@ async function openMemberDetail(uid) {
       </div>
     </div>`;
 
-  // Admin fetches ALL team tasks in one query (rules allow teamId filter for admin)
-  // then filters client-side by assignedTo — avoids per-member query being blocked
+  // Fetch all team tasks if not yet loaded, then filter client-side
   let mTasks = [];
   try {
     if (allTasks.length === 0) {
-      // allTasks not yet loaded — fetch all team tasks now
-      const snap = await getDocs(
-        query(collection(db,'tasks'), where('teamId','==', currentTeam.id))
-      );
-      allTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      await fetchAllTasks();
     }
     mTasks = allTasks.filter(t => t.assignedTo === uid);
   } catch(e) {
@@ -838,8 +906,7 @@ function closeMemberDetail() {
 async function toggleRole(memberId, uid, currentRole) {
   const newRole = currentRole==='admin'?'member':'admin';
   try {
-    // memberId is the Firestore doc ID stored in teamMembers
-    await updateDoc(doc(db,'team_members', memberId), { role: newRole });
+    await updateDoc(doc(db,'team_members', uid), { role: newRole });
     // Update local cache
     teamMembers[uid].role = newRole;
     // Reload members from Firestore to confirm
@@ -978,7 +1045,7 @@ function setFilter(f, el) {
 
 function setLeaderTab(tab) {
   activeLeaderTab = tab;
-  renderLeaderboard();
+  renderLeaderboard(); // async — shows spinner while loading
 }
 
 function toast(msg, type='info') {
