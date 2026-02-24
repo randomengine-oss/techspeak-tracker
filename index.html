@@ -750,21 +750,18 @@ async function openMemberDetail(uid) {
       </div>
     </div>`;
 
-  // Always fetch fresh from Firestore — never rely on cached allTasks
+  // Admin fetches ALL team tasks in one query (rules allow teamId filter for admin)
+  // then filters client-side by assignedTo — avoids per-member query being blocked
   let mTasks = [];
   try {
-    const snap = await getDocs(
-      query(collection(db,'tasks'),
-        where('teamId','==', currentTeam.id),
-        where('assignedTo','==', uid))
-    );
-    mTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    // Also update allTasks cache
-    snap.docs.forEach(d => {
-      const idx = allTasks.findIndex(t=>t.id===d.id);
-      if (idx>=0) allTasks[idx] = { id:d.id, ...d.data() };
-      else allTasks.push({ id:d.id, ...d.data() });
-    });
+    if (allTasks.length === 0) {
+      // allTasks not yet loaded — fetch all team tasks now
+      const snap = await getDocs(
+        query(collection(db,'tasks'), where('teamId','==', currentTeam.id))
+      );
+      allTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    }
+    mTasks = allTasks.filter(t => t.assignedTo === uid);
   } catch(e) {
     container.innerHTML = `<div class="modal-overlay open" onclick="closeMemberDetail()"><div class="modal-sheet" style="padding:40px;text-align:center"><div class="empty-icon">⚠️</div><div class="empty-title">Failed to load</div><div class="empty-sub">${e.message}</div><button class="ob-btn" style="margin-top:16px" onclick="closeMemberDetail()">Close</button></div></div>`;
     return;
