@@ -690,10 +690,16 @@ function renderTeamPage() {
   if (!isAdmin()) { document.getElementById('page-team').innerHTML='<div class="empty-state"><div class="empty-icon">🔒</div><div class="empty-title">Admins only</div></div>'; return; }
 
   const memberList = Object.values(teamMembers);
+  const el = document.getElementById('teamMemberList');
+
+  // Show loading if allTasks not yet populated
+  if (allTasks.length === 0 && memberList.length > 0) {
+    el.innerHTML = '<div class="empty-state"><div class="spinner" style="margin:0 auto"></div><div class="empty-sub" style="margin-top:12px">Loading task data…</div></div>';
+  }
+
   document.getElementById('teamMemberCount').textContent = memberList.length;
   document.getElementById('teamInviteCode').textContent = currentTeam.inviteCode;
 
-  const el = document.getElementById('teamMemberList');
   el.innerHTML = memberList.map(m => {
     const mTasks = allTasks.filter(t=>t.assignedTo===m.uid);
     const sc = statusCounts(mTasks);
@@ -729,19 +735,49 @@ function renderTeamPage() {
 }
 
 // ── MEMBER DETAIL MODAL ───────────────────────────────────
-function openMemberDetail(uid) {
+async function openMemberDetail(uid) {
   const m = teamMembers[uid];
   if (!m) return;
-  const mTasks = allTasks.filter(t=>t.assignedTo===uid);
+
+  // Show loading state immediately
+  const container = document.getElementById('memberDetailModal');
+  container.style.display = 'block';
+  container.innerHTML = `
+    <div class="modal-overlay open">
+      <div class="modal-sheet" style="padding:40px;align-items:center;justify-content:center">
+        <div class="spinner"></div>
+        <div style="margin-top:12px;font-size:13px;color:var(--text3)">Loading tasks…</div>
+      </div>
+    </div>`;
+
+  // Always fetch fresh from Firestore — never rely on cached allTasks
+  let mTasks = [];
+  try {
+    const snap = await getDocs(
+      query(collection(db,'tasks'),
+        where('teamId','==', currentTeam.id),
+        where('assignedTo','==', uid))
+    );
+    mTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Also update allTasks cache
+    snap.docs.forEach(d => {
+      const idx = allTasks.findIndex(t=>t.id===d.id);
+      if (idx>=0) allTasks[idx] = { id:d.id, ...d.data() };
+      else allTasks.push({ id:d.id, ...d.data() });
+    });
+  } catch(e) {
+    container.innerHTML = `<div class="modal-overlay open" onclick="closeMemberDetail()"><div class="modal-sheet" style="padding:40px;text-align:center"><div class="empty-icon">⚠️</div><div class="empty-title">Failed to load</div><div class="empty-sub">${e.message}</div><button class="ob-btn" style="margin-top:16px" onclick="closeMemberDetail()">Close</button></div></div>`;
+    return;
+  }
+
   const sc = statusCounts(mTasks);
   const donePct = pct(sc.done||0, mTasks.length);
 
-  // Build by-status task lists
   const statusGroups = [
-    { key:'wip', label:'⟳ In Progress', color:'var(--wip)' },
-    { key:'pending', label:'⏳ Pending', color:'var(--rose)' },
-    { key:'not-started', label:'◻ Not Started', color:'var(--ns)' },
-    { key:'done', label:'✓ Done', color:'var(--done)' },
+    { key:'wip',         label:'⟳ In Progress', color:'var(--wip)' },
+    { key:'pending',     label:'⏳ Pending',     color:'var(--rose)' },
+    { key:'not-started', label:'◻ Not Started',  color:'var(--ns)' },
+    { key:'done',        label:'✓ Done',          color:'var(--done)' },
   ];
 
   const taskRows = statusGroups.map(sg => {
@@ -752,7 +788,7 @@ function openMemberDetail(uid) {
       ${group.map(t=>`
         <div class="md-task-row">
           <span class="md-task-name">${esc(t.title)}</span>
-          <div style="display:flex;gap:5px;flex-wrap:wrap">
+          <div style="display:flex;gap:5px;flex-wrap:wrap;flex-shrink:0">
             ${t.priority==='high'?'<span class="prio-badge high">HIGH</span>':''}
             ${t.dueDate?`<span class="due-badge${t.dueDate<todayStr()&&t.status!=='done'?' overdue':''}">📅 ${formatD(t.dueDate)}</span>`:''}
             <span class="tag-badge tag-${t.category||'Other'}">${t.category||'Other'}</span>
@@ -761,8 +797,8 @@ function openMemberDetail(uid) {
     </div>`;
   }).join('');
 
-  document.getElementById('memberDetailModal').innerHTML = `
-    <div class="modal-overlay open" onclick="if(event.target===this)closeMemberDetail()" id="mdOverlay">
+  container.innerHTML = `
+    <div class="modal-overlay open" onclick="if(event.target===this)closeMemberDetail()">
       <div class="modal-sheet">
         <div class="modal-drag"></div>
         <div class="modal-header">
@@ -776,28 +812,24 @@ function openMemberDetail(uid) {
           <button class="modal-close" onclick="closeMemberDetail()">✕</button>
         </div>
         <div class="modal-body">
-          <!-- Summary cards -->
           <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px">
             <div class="md-stat-card" style="color:var(--accent)"><div class="md-num">${mTasks.length}</div><div class="md-lbl">Total</div></div>
             <div class="md-stat-card" style="color:var(--done)"><div class="md-num">${sc.done||0}</div><div class="md-lbl">Done</div></div>
             <div class="md-stat-card" style="color:var(--wip)"><div class="md-num">${sc.wip||0}</div><div class="md-lbl">WIP</div></div>
             <div class="md-stat-card" style="color:var(--rose)"><div class="md-num">${(sc.pending||0)+(sc['not-started']||0)}</div><div class="md-lbl">Open</div></div>
           </div>
-          <!-- Progress bar -->
           <div style="margin-bottom:16px">
             <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text3);margin-bottom:5px">
-              <span>Completion</span><span style="font-weight:700;color:var(--done)">${donePct}%</span>
+              <span>Completion rate</span><span style="font-weight:800;color:var(--done)">${donePct}%</span>
             </div>
             <div style="height:8px;background:var(--s3);border-radius:4px;overflow:hidden">
-              <div style="height:100%;width:${donePct}%;background:linear-gradient(90deg,var(--accent),var(--done));border-radius:4px;transition:width 0.7s"></div>
+              <div style="height:100%;width:${donePct}%;background:linear-gradient(90deg,var(--accent),var(--done));border-radius:4px"></div>
             </div>
           </div>
-          <!-- Task list by status -->
-          ${mTasks.length ? taskRows : '<div class="empty-state" style="padding:20px 0"><div class="empty-icon">📭</div><div class="empty-title">No tasks assigned</div></div>'}
+          ${mTasks.length ? taskRows : '<div class="empty-state" style="padding:20px 0"><div class="empty-icon">📭</div><div class="empty-title">No tasks assigned yet</div></div>'}
         </div>
       </div>
     </div>`;
-  document.getElementById('memberDetailModal').style.display = 'block';
 }
 
 function closeMemberDetail() {
@@ -808,10 +840,19 @@ function closeMemberDetail() {
 
 async function toggleRole(memberId, uid, currentRole) {
   const newRole = currentRole==='admin'?'member':'admin';
-  await updateDoc(doc(db,'team_members',memberId), { role: newRole });
-  teamMembers[uid].role = newRole;
-  renderTeamPage();
-  toast(`Role updated to ${newRole}`,'success');
+  try {
+    // memberId is the Firestore doc ID stored in teamMembers
+    await updateDoc(doc(db,'team_members', memberId), { role: newRole });
+    // Update local cache
+    teamMembers[uid].role = newRole;
+    // Reload members from Firestore to confirm
+    await loadTeamMembers();
+    renderTeamPage();
+    toast(`${teamMembers[uid]?.name||'Member'} is now ${newRole} ✓`, 'success');
+  } catch(e) {
+    toast('Failed to update role: ' + e.message, 'error');
+    console.error('toggleRole error:', e);
+  }
 }
 
 // ── WEEKLY / MONTHLY ──────────────────────────────────────
