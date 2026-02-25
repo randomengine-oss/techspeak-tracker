@@ -40,12 +40,13 @@ const gProvider = new GoogleAuthProvider();
 
 // ── STATE ────────────────────────────────────────────────
 let currentUser   = null;
-let currentMember = null; // Firestore member doc
-let currentTeam   = null; // { id, ...teamDoc }
-let teamMembers   = {};   // { uid: memberDoc }
+let currentMember = null;
+let currentTeam   = null;
+let teamMembers   = {};
 let myTasks       = [];
-let allTasks      = [];   // admin only
-let unsubs        = [];   // Firestore listeners to clean up
+let allTasks      = [];
+let archivedTasks = [];   // soft-deleted tasks
+let unsubs        = [];
 let currentPage   = 'today';
 let viewingDate   = null;
 let editingTaskId = null;
@@ -53,6 +54,7 @@ let editingStatus = 'not-started';
 let activeLeaderTab = 'weekly';
 let selectedCat   = 'Work';
 let currentFilter = 'all';
+let activeInboxTab = 'inbox'; // 'inbox' | 'outbox'
 
 // ── DATE UTILS ───────────────────────────────────────────
 const todayStr = () => { const n=new Date(); return n.getFullYear()+'-'+String(n.getMonth()+1).padStart(2,'0')+'-'+String(n.getDate()).padStart(2,'0'); };
@@ -258,14 +260,29 @@ function setupListeners() {
   const myTasksQ = query(
     collection(db, 'tasks'),
     where('teamId', '==', currentTeam.id),
-    where('assignedTo', '==', currentUser.uid)
+    where('assignedTo', '==', currentUser.uid),
+    where('archived', '==', false)
   );
   const u1 = onSnapshot(myTasksQ, snap => {
     myTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    if (currentPage === 'today' || currentPage === 'inbox') refreshCurrentPage();
+    if (['today','inbox','archive'].includes(currentPage)) refreshCurrentPage();
     updateLeaderboardScore();
+    updateInboxBadge();
   });
   unsubs.push(u1);
+
+  // Archived tasks listener
+  const archivedQ = query(
+    collection(db, 'tasks'),
+    where('teamId', '==', currentTeam.id),
+    where('assignedTo', '==', currentUser.uid),
+    where('archived', '==', true)
+  );
+  const uArch = onSnapshot(archivedQ, snap => {
+    archivedTasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (currentPage === 'archive') renderArchive();
+  });
+  unsubs.push(uArch);
 
   // All team tasks listener — needed for leaderboard and admin team view
   // Rules now allow any authenticated member to read all team tasks
@@ -296,12 +313,13 @@ async function fetchAllTasks() {
 function refreshCurrentPage() {
   if (currentPage === 'today') renderToday();
   if (currentPage === 'inbox') renderInbox();
+  if (currentPage === 'archive') renderArchive();
   if (currentPage === 'weekly') renderWeekly();
   if (currentPage === 'monthly') renderMonthly();
 }
 
 // ── PAGE SWITCHING ────────────────────────────────────────
-const navPages = ['today','inbox','leaderboard','team','settings'];
+const navPages = ['today','inbox','archive','leaderboard','team','settings'];
 function switchPage(pg) {
   currentPage = pg;
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -314,6 +332,7 @@ function switchPage(pg) {
   document.getElementById('appScroll').scrollTop = 0;
   if (pg==='today')       { renderDayPicker(); renderToday(); }
   if (pg==='inbox')       renderInbox();
+  if (pg==='archive')     renderArchive();
   if (pg==='leaderboard') renderLeaderboard();
   if (pg==='team')        renderTeamPage();
   if (pg==='settings')    renderSettings();
@@ -363,6 +382,26 @@ function renderToday() {
   const ld = localDate(viewingDate);
   document.getElementById('todayDateBig').textContent = ld.toLocaleDateString('en-IN',{weekday:'long'});
   document.getElementById('todayDateSub').textContent = ld.toLocaleDateString('en-IN',{month:'long',day:'numeric',year:'numeric'});
+
+  // Pending/overdue banner
+  const overdueTasks = myTasks.filter(t=>isOverdue(t));
+  const pendingEl = document.getElementById('pendingBanner');
+  if (pendingEl) {
+    if (overdueTasks.length > 0) {
+      pendingEl.innerHTML = `<div class="pending-banner" onclick="setFilter('pending',document.querySelector('.ftab[data-f=pending]'))">
+        <span class="pb-label">⚠️ ${overdueTasks.length} overdue task${overdueTasks.length>1?'s':''}</span>
+        <span class="pb-count">View</span>
+      </div>`;
+    } else {
+      const openToday = myTasks.filter(t=>t.date===todayStr()&&t.status!=='done').length;
+      pendingEl.innerHTML = openToday>0
+        ? `<div class="pending-banner" onclick="setFilter('not-started',document.querySelector('.ftab[data-f=not-started]'))">
+            <span class="pb-label">📋 ${openToday} task${openToday>1?'s':''} still open today</span>
+            <span class="pb-count">View</span>
+          </div>`
+        : '';
+    }
+  }
 
   // Filter tasks
   const cats = ['Work','Personal','Health','Learning','Other'];
@@ -438,6 +477,7 @@ async function addTask() {
     category: selectedCat,
     date: todayStr(), dueDate,
     subtasks: [], comments: [],
+    archived: false,
     createdAt: serverTimestamp(), updatedAt: serverTimestamp()
   };
   try {
@@ -451,14 +491,75 @@ async function addTask() {
 
 // ── INBOX ─────────────────────────────────────────────────
 function renderInbox() {
+  // Render tab state
+  document.getElementById('inboxTabBtn').classList.toggle('active', activeInboxTab==='inbox');
+  document.getElementById('outboxTabBtn').classList.toggle('active', activeInboxTab==='outbox');
+  document.getElementById('inboxListWrap').style.display = activeInboxTab==='inbox'?'':'none';
+  document.getElementById('outboxListWrap').style.display = activeInboxTab==='outbox'?'':'none';
+
   const assigned = myTasks.filter(t=>t.createdBy!==currentUser.uid && t.status!=='done');
-  const el = document.getElementById('inboxList');
   document.getElementById('inboxCount').textContent = assigned.length;
+
+  const inboxEl = document.getElementById('inboxList');
   if (!assigned.length) {
-    el.innerHTML=`<div class="empty-state"><div class="empty-icon">📥</div><div class="empty-title">Inbox is clear</div><div class="empty-sub">No tasks assigned to you by others</div></div>`;
+    inboxEl.innerHTML='<div class="empty-state"><div class="empty-icon">📥</div><div class="empty-title">Inbox is clear</div><div class="empty-sub">No tasks assigned to you by others</div></div>';
+  } else {
+    inboxEl.innerHTML = assigned.map(t=>renderTaskCard(t,false)).join('');
+  }
+  if (activeInboxTab==='outbox') renderOutbox();
+}
+
+function switchInboxTab(tab) {
+  activeInboxTab = tab;
+  renderInbox();
+}
+
+function updateInboxBadge() {
+  const count = myTasks.filter(t=>t.createdBy!==currentUser.uid&&t.status!=='done').length;
+  const el = document.getElementById('inboxNavBadge');
+  if (el) { el.textContent=count; el.style.display=count?'':'none'; }
+}
+
+// ── OUTBOX (tasks assigned BY me to others) ──────────────
+function renderOutbox() {
+  const sent = myTasks.filter(t=>t.createdBy===currentUser.uid && t.assignedTo!==currentUser.uid);
+  // Also check allTasks for admin
+  const adminSent = isAdmin() ? allTasks.filter(t=>t.createdBy===currentUser.uid && t.assignedTo!==currentUser.uid && !myTasks.find(m=>m.id===t.id)) : [];
+  const all = [...sent, ...adminSent];
+  const el = document.getElementById('outboxList');
+  document.getElementById('outboxCount').textContent = all.length;
+  if (!all.length) {
+    el.innerHTML='<div class="empty-state"><div class="empty-icon">📤</div><div class="empty-title">No outgoing tasks</div><div class="empty-sub">Tasks you assign to others will appear here</div></div>';
     return;
   }
-  el.innerHTML = assigned.map(t=>renderTaskCard(t,false)).join('');
+  el.innerHTML = all.map(t=>renderTaskCard(t,true)).join('');
+}
+
+// ── ARCHIVE ───────────────────────────────────────────────
+function renderArchive() {
+  const el = document.getElementById('archiveList');
+  if (!archivedTasks.length) {
+    el.innerHTML='<div class="empty-state"><div class="empty-icon">🗄️</div><div class="empty-title">Archive is empty</div><div class="empty-sub">Deleted tasks appear here</div></div>';
+    return;
+  }
+  el.innerHTML = archivedTasks.map(t => {
+    const archivedDate = t.archivedAt ? new Date(t.archivedAt.seconds*1000).toLocaleDateString('en-IN',{month:'short',day:'numeric'}) : '';
+    return `<div class="task-card" style="opacity:0.75">
+      <div class="task-top">
+        <div class="task-body">
+          <div class="task-name" style="text-decoration:line-through;color:var(--text3)">${esc(t.title)}</div>
+          <div class="task-meta-row">
+            <span class="tag-badge tag-${t.category||'Other'}">${t.category||'Other'}</span>
+            ${archivedDate?`<span class="due-badge">🗄️ ${archivedDate}</span>`:''}
+          </div>
+        </div>
+        <div class="task-actions" style="gap:5px">
+          <button class="ss-btn" onclick="restoreTask('${t.id}');event.stopPropagation()" style="color:var(--done);border-color:rgba(0,184,122,0.3)">↩ Restore</button>
+          <button class="ss-btn" onclick="permanentDelete('${t.id}');event.stopPropagation()" style="color:var(--rose);border-color:rgba(224,51,74,0.3)">✕ Delete</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
 }
 
 // ── TASK DETAIL MODAL ─────────────────────────────────────
@@ -599,10 +700,22 @@ async function saveTaskEdit() {
 async function deleteTask(id) {
   const tid = id || editingTaskId;
   if (!tid) return;
-  if (!confirm('Delete this task?')) return;
-  await deleteDoc(doc(db,'tasks',tid));
+  if (!confirm('Move this task to archive?')) return;
+  await updateDoc(doc(db,'tasks',tid), { archived: true, archivedAt: serverTimestamp(), updatedAt: serverTimestamp() });
   closeModal();
-  toast('Task deleted','info');
+  toast('Task archived','info');
+}
+
+async function restoreTask(id) {
+  await updateDoc(doc(db,'tasks',id), { archived: false, archivedAt: null, updatedAt: serverTimestamp() });
+  toast('Task restored ✓','success');
+  renderArchive();
+}
+
+async function permanentDelete(id) {
+  if (!confirm('Permanently delete? This cannot be undone.')) return;
+  await deleteDoc(doc(db,'tasks',id));
+  toast('Permanently deleted','info');
 }
 
 // ── ASSIGN DROPDOWN ───────────────────────────────────────
@@ -985,6 +1098,44 @@ function renderSettings() {
   document.getElementById('settingsTeamName').textContent = currentTeam.name;
   document.getElementById('settingsInviteCode').textContent = currentTeam.inviteCode;
   document.getElementById('settingsRole').textContent = currentMember.role==='admin'?'Admin':'Member';
+
+  // Notification UI state
+  const enabled = Notification.permission==='granted' && localStorage.getItem('ts_notif_enabled');
+  const savedTime = localStorage.getItem('ts_eveningTime')||'18:00';
+  const notifSection = document.getElementById('notifSettingsSection');
+  if (notifSection) {
+    notifSection.innerHTML = `
+      <div class="ss-title">Notifications</div>
+      <div class="ss-row">
+        <div class="ss-info">
+          <div class="ss-name">Status</div>
+          <div class="ss-desc">${enabled?'Active — reminders on':'Tap Enable to turn on'}</div>
+        </div>
+        ${enabled
+          ? '<button class="set-btn" onclick="disableNotifs()" style="color:var(--rose)">Disable</button>'
+          : '<button class="set-btn" onclick="requestNotifPerm()">Enable</button>'}
+      </div>
+      ${enabled ? `
+      <div class="ss-row">
+        <div class="ss-info">
+          <div class="ss-name">Reminder Time</div>
+          <div class="ss-desc">Daily evening nudge</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="time" id="notifTimePicker" value="${savedTime}"
+            style="background:var(--s2);border:1px solid var(--border2);border-radius:10px;
+            padding:7px 10px;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text);outline:none">
+          <button class="set-btn" onclick="saveNotifTime()">Save</button>
+        </div>
+      </div>
+      <div class="ss-row">
+        <div class="ss-info">
+          <div class="ss-name">Test Notification</div>
+          <div class="ss-desc">Send a test right now</div>
+        </div>
+        <button class="set-btn" onclick="fireEveningNotif()">Test</button>
+      </div>` : ''}`;
+  }
 }
 
 function copyInviteCode() {
@@ -1062,31 +1213,77 @@ async function requestNotifPerm() {
   if (!('Notification' in window)) { toast('Not supported','warn'); return; }
   const p = await Notification.requestPermission();
   if (p==='granted') {
+    localStorage.setItem('ts_notif_enabled','1');
     const reg = await navigator.serviceWorker.ready;
-    if (reg) await reg.showNotification('Techspeak Tracker ✦',{body:'Notifications enabled! You\'ll get evening reminders.',tag:'ts-setup'});
+    if (reg) await reg.showNotification('Techspeak Tracker',{
+      body:"Notifications on! You'll get a reminder at your set time.",
+      tag:'ts-setup', icon:'./manifest.json'
+    });
     toast('Notifications enabled ✓','success');
+    renderSettings(); // refresh UI
     scheduleNotifs();
-  } else { toast('Permission denied','warn'); }
+  } else {
+    toast('Permission denied — enable in phone Settings','warn');
+  }
+}
+
+async function disableNotifs() {
+  localStorage.removeItem('ts_notif_enabled');
+  if (notifTimer) { clearInterval(notifTimer); notifTimer=null; }
+  toast('Notifications disabled','info');
+  renderSettings();
+}
+
+async function saveNotifTime() {
+  const t = document.getElementById('notifTimePicker').value;
+  if (!t) return;
+  localStorage.setItem('ts_eveningTime', t);
+  toast(`Reminder set for ${formatTime12(t)} ✓`,'success');
+  scheduleNotifs(); // restart with new time
+}
+
+function formatTime12(t) {
+  const [h,m] = t.split(':').map(Number);
+  const ampm = h>=12?'PM':'AM';
+  return `${h%12||12}:${String(m).padStart(2,'0')} ${ampm}`;
 }
 
 let notifTimer = null;
+let lastFiredMinute = '';
+
 function scheduleNotifs() {
   if (notifTimer) clearInterval(notifTimer);
+  if (Notification.permission !== 'granted') return;
+  if (!localStorage.getItem('ts_notif_enabled')) return;
   notifTimer = setInterval(async()=>{
-    const now=new Date(), hhmm=String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0');
-    const et = localStorage.getItem('ts_eveningTime')||'18:00';
-    if (hhmm===et) await fireEveningNotif();
-  },60000);
+    const now = new Date();
+    const hhmm = String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0');
+    const target = localStorage.getItem('ts_eveningTime')||'18:00';
+    if (hhmm === target && hhmm !== lastFiredMinute) {
+      lastFiredMinute = hhmm;
+      await fireEveningNotif();
+    }
+  }, 30000); // check every 30s for reliability
 }
 
 async function fireEveningNotif() {
-  if (Notification.permission!=='granted') return;
-  const open = myTasks.filter(t=>t.date===todayStr()&&t.status!=='done');
-  if (!open.length) return;
-  const reg = await navigator.serviceWorker.ready;
-  if (reg) await reg.showNotification(`Techspeak Tracker 🌙`,{
-    body:`${open.length} task${open.length>1?'s':''} still open today`,tag:'ts-evening',renotify:true
+  if (Notification.permission !== 'granted') return;
+  const open = myTasks.filter(t => t.date===todayStr() && t.status!=='done' && !t.archived);
+  const reg = await navigator.serviceWorker.ready.catch(()=>null);
+  if (!reg) return;
+  const body = open.length
+    ? `You have ${open.length} open task${open.length>1?'s':''} today — let\'s finish strong! 💪`
+    : 'Great work! All tasks done for today 🎉';
+  await reg.showNotification('Techspeak Tracker 🌙', {
+    body, tag:'ts-evening', renotify:true, requireInteraction: false
   });
+}
+
+// Auto-start notifications when app loads (if previously enabled)
+function initNotifs() {
+  if (Notification.permission==='granted' && localStorage.getItem('ts_notif_enabled')) {
+    scheduleNotifs();
+  }
 }
 
 // Keyboard shortcuts
@@ -1106,10 +1303,11 @@ if ('serviceWorker' in navigator) {
 Object.assign(window, {
   signInGoogle, signOutUser, createTeam, joinTeam, addTask, quickToggle, quickStatus,
   openTask, toggleSubtask, deleteSubtask, addSubtask, addComment, selectEditStatus,
-  saveTaskEdit, deleteTask, toggleRole, copyInviteCode, requestNotifPerm,
+  saveTaskEdit, deleteTask, restoreTask, permanentDelete, toggleRole, copyInviteCode,
+  requestNotifPerm, disableNotifs, saveNotifTime, fireEveningNotif,
   switchPage, viewDay, jumpToToday, selectCat, setFilter, setLeaderTab,
   openModal, closeModal, renderWeekly, renderMonthly, populateAssignDropdown,
-  openMemberDetail, closeMemberDetail
+  openMemberDetail, closeMemberDetail, switchInboxTab, renderArchive
 });
 
 </script>
@@ -1499,6 +1697,29 @@ html,body{height:100%;font-family:'Plus Jakarta Sans',sans-serif;background:var(
 .config-warn b{font-weight:700}
 .config-warn code{font-family:'JetBrains Mono',monospace;background:rgba(224,138,0,0.1);padding:1px 5px;border-radius:4px;font-size:11px}
 
+/* Inbox/Outbox tabs */
+.inbox-tabs{display:flex;gap:6px;padding:0 16px 12px}
+.itab{flex:1;padding:10px;border-radius:14px;border:1px solid var(--border2);background:transparent;
+  font-family:'Plus Jakarta Sans',sans-serif;font-size:13px;font-weight:700;color:var(--text3);
+  cursor:pointer;transition:all 0.15s}
+.itab.active{background:var(--accent);color:#fff;border-color:transparent;box-shadow:0 4px 12px rgba(59,111,245,0.3)}
+
+/* Login logo */
+.login-logo{margin-bottom:16px;display:flex;justify-content:center}
+
+/* Archive restore buttons */
+.restore-btn{background:rgba(0,184,122,0.08);border:1px solid rgba(0,184,122,0.25);border-radius:8px;
+  padding:5px 12px;font-size:11px;font-weight:700;color:var(--done);cursor:pointer;font-family:'Plus Jakarta Sans',sans-serif}
+.perm-del-btn{background:rgba(224,51,74,0.08);border:1px solid rgba(224,51,74,0.25);border-radius:8px;
+  padding:5px 12px;font-size:11px;font-weight:700;color:var(--rose);cursor:pointer;font-family:'Plus Jakarta Sans',sans-serif}
+
+/* Pending task section on today */
+.pending-banner{margin:0 16px 10px;padding:10px 14px;background:rgba(224,51,74,0.06);
+  border:1px solid rgba(224,51,74,0.2);border-radius:12px;
+  display:flex;align-items:center;justify-content:space-between;cursor:pointer}
+.pb-label{font-size:12px;font-weight:700;color:var(--rose)}
+.pb-count{background:var(--rose);color:#fff;font-size:11px;font-weight:800;padding:2px 8px;border-radius:10px}
+
 /* Member task bar */
 .member-task-bar{display:flex;align-items:center;gap:8px;margin:5px 0}
 .mtb-track{flex:1;height:5px;background:var(--s3);border-radius:3px;overflow:hidden}
@@ -1527,7 +1748,24 @@ html,body{height:100%;font-family:'Plus Jakarta Sans',sans-serif;background:var(
 <!-- LOGIN -->
 <div class="screen" id="screen-login">
   <div style="margin-top:calc(env(safe-area-inset-top)+40px);display:flex;flex-direction:column;align-items:center;padding:32px">
-    <div class="login-logo">✦</div>
+    <div class="login-logo">
+      <svg width="72" height="72" viewBox="0 0 72 72" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="72" height="72" rx="20" fill="url(#lg1)"/>
+        <path d="M20 24h32M36 24v24" stroke="white" stroke-width="5" stroke-linecap="round"/>
+        <circle cx="52" cy="46" r="11" fill="url(#lg2)"/>
+        <path d="M47 46l3 3 6-6" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <defs>
+          <linearGradient id="lg1" x1="0" y1="0" x2="72" y2="72" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#3b6ff5"/>
+            <stop offset="1" stop-color="#6c47ff"/>
+          </linearGradient>
+          <linearGradient id="lg2" x1="41" y1="35" x2="63" y2="57" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#00b87a"/>
+            <stop offset="1" stop-color="#00d68f"/>
+          </linearGradient>
+        </defs>
+      </svg>
+    </div>
     <div class="login-title">Techspeak Tracker</div>
     <div class="login-sub">Team productivity, beautifully organized</div>
     <button class="google-btn" id="googleSignIn" onclick="signInGoogle()">
@@ -1587,6 +1825,7 @@ html,body{height:100%;font-family:'Plus Jakarta Sans',sans-serif;background:var(
         <div class="date-sub" id="todayDateSub"></div>
       </div>
       <div class="mini-stats-row" id="todayStats"></div>
+      <div id="pendingBanner"></div>
       <div class="day-picker" id="dayPicker"></div>
       <div class="view-banner" id="viewBanner">
         <span id="viewBannerLabel"></span>
@@ -1638,14 +1877,34 @@ html,body{height:100%;font-family:'Plus Jakarta Sans',sans-serif;background:var(
       <div class="task-list" id="taskList"></div>
     </div>
 
-    <!-- INBOX -->
+    <!-- INBOX / OUTBOX -->
     <div class="page" id="page-inbox">
       <div class="inbox-header">
-        <div class="date-big" style="font-size:22px">Inbox</div>
+        <div class="date-big" style="font-size:22px">Messages</div>
         <span class="inbox-badge" id="inboxCount">0</span>
       </div>
-      <div class="sec-label">TASKS ASSIGNED TO YOU BY OTHERS</div>
-      <div class="task-list" id="inboxList"></div>
+      <div class="inbox-tabs">
+        <button class="itab active" id="inboxTabBtn" onclick="switchInboxTab('inbox')">📥 Inbox</button>
+        <button class="itab" id="outboxTabBtn" onclick="switchInboxTab('outbox')">📤 Outbox</button>
+      </div>
+      <div id="inboxListWrap">
+        <div class="sec-label">ASSIGNED TO ME BY OTHERS</div>
+        <div class="task-list" id="inboxList"></div>
+      </div>
+      <div id="outboxListWrap" style="display:none">
+        <div class="sec-label">ASSIGNED BY ME TO OTHERS</div>
+        <div class="task-list" id="outboxList"></div>
+        <div id="outboxCount" style="display:none">0</div>
+      </div>
+    </div>
+
+    <!-- ARCHIVE -->
+    <div class="page" id="page-archive">
+      <div class="date-strip">
+        <div class="date-big">🗄️ Archive</div>
+        <div class="date-sub">Deleted tasks — restore or permanently remove</div>
+      </div>
+      <div class="task-list" id="archiveList"></div>
     </div>
 
     <!-- LEADERBOARD -->
@@ -1703,7 +1962,7 @@ html,body{height:100%;font-family:'Plus Jakarta Sans',sans-serif;background:var(
         </div>
       </div>
 
-      <div class="settings-section">
+      <div class="settings-section" id="notifSettingsSection">
         <div class="ss-title">Notifications</div>
         <div class="ss-row">
           <div class="ss-info"><div class="ss-name">Evening Reminder</div><div class="ss-desc">Daily pending task alert</div></div>
@@ -1750,8 +2009,12 @@ html,body{height:100%;font-family:'Plus Jakarta Sans',sans-serif;background:var(
     <button class="nav-btn active" id="nav-today" onclick="switchPage('today')">
       <span class="nav-icon">☀️</span><span class="nav-label">Today</span>
     </button>
-    <button class="nav-btn" id="nav-inbox" onclick="switchPage('inbox')">
+    <button class="nav-btn" id="nav-inbox" onclick="switchPage('inbox')" style="position:relative">
       <span class="nav-icon">📥</span><span class="nav-label">Inbox</span>
+      <span id="inboxNavBadge" style="display:none;position:absolute;top:8px;right:calc(50% - 18px);background:var(--rose);color:#fff;font-size:9px;font-weight:800;padding:1px 5px;border-radius:10px;min-width:16px;text-align:center"></span>
+    </button>
+    <button class="nav-btn" id="nav-archive" onclick="switchPage('archive')">
+      <span class="nav-icon">🗄️</span><span class="nav-label">Archive</span>
     </button>
     <button class="nav-btn" id="nav-leaderboard" onclick="switchPage('leaderboard')">
       <span class="nav-icon">🏆</span><span class="nav-label">Ranks</span>
@@ -1846,7 +2109,7 @@ html,body{height:100%;font-family:'Plus Jakarta Sans',sans-serif;background:var(
     </div>
 
     <div class="modal-footer">
-      <button class="modal-delete-btn" onclick="deleteTask()">Delete</button>
+      <button class="modal-delete-btn" onclick="deleteTask()">🗄️ Archive</button>
       <button class="modal-save-btn" onclick="saveTaskEdit()">Save Changes</button>
     </div>
   </div>
